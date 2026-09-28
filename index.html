@@ -1,0 +1,802 @@
+#requires -Version 5.1
+<#
+PowerShell ExecutionPolicy hints:
+  Current process only:
+    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+  Current user (persistent):
+    Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
+
+For the remote bootstrap, run the exact prefix copied to the clipboard.
+A second remote run without parameters saves this script as .\knock.ps1.
+A remote run with parameters never saves the script.
+A local .\knock.ps1 run never triggers the remote bootstrap.
+
+.SYNOPSIS
+    Lightweight TCP/UDP/ICMP diagnostic runner.
+
+.DESCRIPTION
+    Commands are executed strictly from left to right.
+    Commands can be written with or without the leading --.
+    A bare host is also accepted at the beginning and by templates.
+
+    Packet size for --ping is the IP packet size including IP + ICMP headers:
+      IPv4: total = payload + 20-byte IP header + 8-byte ICMP header
+      IPv6: total = payload + 40-byte IP header + 8-byte ICMPv6 header
+
+    Therefore, for IPv4 --ping 31 sends 3 bytes of ICMP payload.
+
+    TCP/UDP port syntax:
+      4321       remote port 4321, ephemeral source port
+      1234:4321  source port 1234, remote port 4321
+
+    UDP is a datagram probe, not a real connection establishment. The script
+    sends one byte. If a reply/ICMP error is received, it reports it; otherwise
+    timeout means only that no response arrived.
+#>
+
+Set-StrictMode -Version Latest
+
+$script:DefaultTimeoutMs = 300
+
+function Show-ShortHelp {
+    @"
+tcp [host] port[:remote]       TCP probe, default timeout 300 ms
+udp [host] port[:remote]       UDP datagram probe, default timeout 300 ms
+ping [host] [count] size       ICMP ping; size includes IP+ICMP headers
+delay [ms]                     Pause before next command, default 300 ms
+ip host                        Set current target host
+host host                      Alias for ip
+timeout ms                     Set TCP/UDP timeout for following probes
+"@
+}
+
+function Show-Usage {
+    @"
+knock.ps1 - network diagnostic runner
+
+Commands are executed from left to right.
+
+Short syntax:
+  tcp [host] port[:remote]
+  udp [host] port[:remote]
+  ping [host] [count] size
+  delay [ms]
+  ip host
+  timeout ms
+
+Examples:
+  1.1.1.1 tcp 443 ping 32
+  1.1.1.1 tcp 1234 delay 1000 ping 31 udp 4321
+  tcp 1.1.1.1 443 udp 8.8.8.8 53
+  ip 1.1.1.1 tcp 1000 udp 1000 ip 2.2.2.2 ping 32 tcp 1000
+  udp 1.1.1.1 1234:4321
+
+Templates:
+  host port size                 TCP port, then one ping of size
+  2 [host] port size             Same as the default template
+  icmp [host] size1 size2 ...    One ping per size, 1000 ms between pings
+
+Ping size is the complete IP packet size, including IP and ICMP headers.
+For IPv4, payload = size - 28. For IPv6, payload = size - 48.
+UDP sends one probe datagram and waits for a reply or ICMP error.
+
+Remote bootstrap:
+  First remote run without parameters copies the launch prefix to clipboard.
+  Second remote run without parameters saves the full script as .\knock.ps1.
+  If the remote run has parameters, no local copy is made.
+
+ExecutionPolicy:
+  Process only: Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+  Current user: Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force
+"@
+}
+
+function Is-IntegerToken {
+    param([string]$Value)
+    $dummy = 0
+    return [int]::TryParse($Value, [ref]$dummy)
+}
+
+function Parse-PortSpec {
+    param([string]$Value)
+
+    if ($Value -notmatch '^(\d+)(?::(\d+))?$') {
+        throw "Invalid port specification '$Value'. Expected PORT or SOURCE:PORT."
+    }
+
+    # 4321       -> remote port 4321, ephemeral source port
+    # 1234:4321  -> source port 1234, remote port 4321
+    $sourcePort = $null
+    if ($Matches[2]) {
+        $sourcePort = [int]$Matches[1]
+        $remotePort = [int]$Matches[2]
+    } else {
+        $remotePort = [int]$Matches[1]
+    }
+
+    foreach ($port in @($remotePort, $sourcePort)) {
+        if ($null -ne $port -and ($port -lt 1 -or $port -gt 65535)) {
+            throw "Port '$port' is outside 1..65535."
+        }
+    }
+
+    [pscustomobject]@{
+        SourcePort = $sourcePort
+        RemotePort = $remotePort
+    }
+}
+
+function Copy-ToClipboard {
+    param([Parameter(Mandatory)][string]$Text)
+
+    try {
+        if (Get-Command Set-Clipboard -ErrorAction SilentlyContinue) {
+            Set-Clipboard -Value $Text -ErrorAction Stop
+            return $true
+        }
+    } catch {
+        # Fall through to clip.exe.
+    }
+
+    try {
+        $Text | clip.exe
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-RemoteScriptBlock {
+    # The downloaded script is executed through ScriptBlock::Create(...).
+    # A normal local .ps1 has both PSScriptRoot and PSCommandPath populated.
+    return [string]::IsNullOrWhiteSpace($PSScriptRoot) -and
+           [string]::IsNullOrWhiteSpace($PSCommandPath)
+}
+
+function Invoke-RemoteNoParameterBootstrap {
+    param(
+        [string]$SourceUrl,
+        [string]$EnvMarkerName
+    )
+
+    $launchPrefix = '& ([scriptblock]::Create((irm "{0}"))) ' -f $SourceUrl
+    $example = $launchPrefix + '1.1.1.1 tcp 1234 ping 33 udp 4321'
+    $marker = [Environment]::GetEnvironmentVariable($EnvMarkerName, 'Process')
+
+    if ($marker -ne '1') {
+        [Environment]::SetEnvironmentVariable($EnvMarkerName, '1', 'Process')
+
+        $copied = Copy-ToClipboard -Text $launchPrefix
+        Write-Host 'Параметров нет.'
+        if ($copied) {
+            Write-Host 'Ссылка уже в буфере обмена. Нажмите Ctrl+V и добавьте параметры:'
+        } else {
+            Write-Host 'Скопируйте строку запуска вручную и добавьте параметры:'
+        }
+        Write-Host $launchPrefix
+        Write-Host ''
+        Write-Host 'Пример:'
+        Write-Host $example
+        Write-Host ''
+        Show-ShortHelp
+        return
+    }
+
+    # Second remote run without parameters: save the full script locally.
+    try {
+        $source = Invoke-RestMethod -UseBasicParsing -Uri $SourceUrl -ErrorAction Stop
+        $localPath = Join-Path (Get-Location) 'knock.ps1'
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($localPath, [string]$source, $utf8NoBom)
+
+        $policyHint = 'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force'
+        $copied = Copy-ToClipboard -Text $policyHint
+
+        Write-Host "Скрипт сохранен: $localPath"
+        Write-Host ''
+        Write-Host 'Теперь его можно запускать локально, например:'
+        Write-Host '  .\knock.ps1 1.1.1.1 tcp 1234 ping 33 udp 4321'
+        Write-Host ''
+        Write-Host 'Если Shell ExecutionPolicy блокирует запуск .ps1:'
+        Write-Host "  $policyHint"
+        Write-Host 'Для постоянного разрешения для текущего пользователя:'
+        Write-Host '  Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy Bypass -Force'
+        if ($copied) {
+            Write-Host ''
+            Write-Host 'Подсказка для ExecutionPolicy уже скопирована в буфер. Нажмите Ctrl+V.'
+        }
+    }
+    catch {
+        Write-Error "Не удалось сохранить knock.ps1: $($_.Exception.Message)"
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable($EnvMarkerName, $null, 'Process')
+    }
+}
+
+function Resolve-TargetAddress {
+    param([Parameter(Mandatory)][string]$HostName)
+
+    try {
+        $addresses = [System.Net.Dns]::GetHostAddresses($HostName)
+    }
+    catch {
+        throw "Cannot resolve '$HostName': $($_.Exception.Message)"
+    }
+
+    if (-not $addresses -or $addresses.Count -eq 0) {
+        throw "Cannot resolve '$HostName'."
+    }
+
+    # Prefer IPv4 for a stable, predictable packet-size calculation.
+    $ipv4 = @($addresses | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork })
+    if ($ipv4.Count -gt 0) {
+        return $ipv4[0]
+    }
+
+    $ipv6 = @($addresses | Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6 })
+    if ($ipv6.Count -gt 0) {
+        return $ipv6[0]
+    }
+
+    throw "No usable IP address found for '$HostName'."
+}
+
+function New-Socket {
+    param(
+        [Parameter(Mandatory)] [System.Net.IPAddress]$Address,
+        [Parameter(Mandatory)] [System.Net.Sockets.SocketType]$SocketType,
+        [Parameter(Mandatory)] [System.Net.Sockets.ProtocolType]$ProtocolType
+    )
+
+    return New-Object System.Net.Sockets.Socket -ArgumentList @(
+        $Address.AddressFamily,
+        $SocketType,
+        $ProtocolType
+    )
+}
+
+function Format-SocketError {
+    param([System.Net.Sockets.SocketException]$Exception)
+
+    switch ($Exception.SocketErrorCode) {
+        ([System.Net.Sockets.SocketError]::ConnectionRefused) {
+            return 'connection refused'
+        }
+        ([System.Net.Sockets.SocketError]::TimedOut) {
+            return 'timeout'
+        }
+        ([System.Net.Sockets.SocketError]::HostNotFound) {
+            return 'host not found'
+        }
+        ([System.Net.Sockets.SocketError]::NetworkUnreachable) {
+            return 'network unreachable'
+        }
+        ([System.Net.Sockets.SocketError]::HostUnreachable) {
+            return 'host unreachable'
+        }
+        ([System.Net.Sockets.SocketError]::ConnectionReset) {
+            return 'connection reset / ICMP unreachable'
+        }
+        default {
+            return ("{0} ({1})" -f $Exception.Message, [int]$Exception.SocketErrorCode)
+        }
+    }
+}
+
+function Test-TcpPort {
+    param(
+        [Parameter(Mandatory)] [string]$HostName,
+        [Parameter(Mandatory)] [int]$RemotePort,
+        [int]$SourcePort,
+        [Parameter(Mandatory)] [int]$TimeoutMs
+    )
+
+    $address = Resolve-TargetAddress -HostName $HostName
+    $socket = $null
+    $waitHandle = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        $socket = New-Socket -Address $address -SocketType ([System.Net.Sockets.SocketType]::Stream) -ProtocolType ([System.Net.Sockets.ProtocolType]::Tcp)
+
+        if ($null -ne $SourcePort) {
+            $bindAddress = if ($address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                [System.Net.IPAddress]::Any
+            } else {
+                [System.Net.IPAddress]::IPv6Any
+            }
+            $socket.Bind((New-Object -TypeName System.Net.IPEndPoint -ArgumentList @($bindAddress, $SourcePort)))
+        }
+
+        $async = $socket.BeginConnect($address, $RemotePort, $null, $null)
+        $waitHandle = $async.AsyncWaitHandle
+
+        if (-not $waitHandle.WaitOne($TimeoutMs)) {
+            $sw.Stop()
+            return [pscustomobject]@{ Status = 'TIMEOUT'; Detail = "no TCP connection within $TimeoutMs ms"; DurationMs = $sw.ElapsedMilliseconds }
+        }
+
+        try {
+            $socket.EndConnect($async)
+            $sw.Stop()
+            return [pscustomobject]@{ Status = 'OPEN'; Detail = 'TCP connection established'; DurationMs = $sw.ElapsedMilliseconds }
+        }
+        catch [System.Net.Sockets.SocketException] {
+            $sw.Stop()
+            $detail = Format-SocketError -Exception $_.Exception
+            $status = if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionRefused) { 'REFUSED' } else { 'ERROR' }
+            return [pscustomobject]@{ Status = $status; Detail = $detail; DurationMs = $sw.ElapsedMilliseconds }
+        }
+    }
+    catch [System.Net.Sockets.SocketException] {
+        $sw.Stop()
+        return [pscustomobject]@{ Status = 'ERROR'; Detail = (Format-SocketError -Exception $_.Exception); DurationMs = $sw.ElapsedMilliseconds }
+    }
+    catch {
+        $sw.Stop()
+        return [pscustomobject]@{ Status = 'ERROR'; Detail = $_.Exception.Message; DurationMs = $sw.ElapsedMilliseconds }
+    }
+    finally {
+        if ($waitHandle) { $waitHandle.Dispose() }
+        if ($socket) { $socket.Dispose() }
+    }
+}
+
+function Test-UdpPort {
+    param(
+        [Parameter(Mandatory)] [string]$HostName,
+        [Parameter(Mandatory)] [int]$RemotePort,
+        [int]$SourcePort,
+        [Parameter(Mandatory)] [int]$TimeoutMs
+    )
+
+    $address = Resolve-TargetAddress -HostName $HostName
+    $socket = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        $socket = New-Socket -Address $address -SocketType ([System.Net.Sockets.SocketType]::Dgram) -ProtocolType ([System.Net.Sockets.ProtocolType]::Udp)
+
+        if ($null -ne $SourcePort) {
+            $bindAddress = if ($address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                [System.Net.IPAddress]::Any
+            } else {
+                [System.Net.IPAddress]::IPv6Any
+            }
+            $socket.Bind((New-Object -TypeName System.Net.IPEndPoint -ArgumentList @($bindAddress, $SourcePort)))
+        }
+
+        $socket.Connect($address, $RemotePort)
+        [byte[]]$probe = @(0)
+        [void]$socket.Send($probe)
+
+        # A connected UDP socket can surface ICMP errors on Receive().
+        $socket.ReceiveTimeout = $TimeoutMs
+        $receiveBuffer = New-Object byte[] 65535
+        $remoteAddress = if ($address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { [System.Net.IPAddress]::Any } else { [System.Net.IPAddress]::IPv6Any }
+        $remoteEndPoint = New-Object -TypeName System.Net.IPEndPoint -ArgumentList @($remoteAddress, 0)
+
+        try {
+            $received = $socket.Receive($receiveBuffer, [ref]$remoteEndPoint)
+            $sw.Stop()
+            return [pscustomobject]@{ Status = 'REPLY'; Detail = "UDP reply received ($received bytes)"; DurationMs = $sw.ElapsedMilliseconds }
+        }
+        catch [System.Net.Sockets.SocketException] {
+            $sw.Stop()
+            if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::TimedOut) {
+                return [pscustomobject]@{ Status = 'NO-REPLY'; Detail = "datagram sent; no UDP/ICMP response within $TimeoutMs ms"; DurationMs = $sw.ElapsedMilliseconds }
+            }
+            if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionReset) {
+                return [pscustomobject]@{ Status = 'ICMP-UNREACHABLE'; Detail = 'ICMP port unreachable / connection reset received'; DurationMs = $sw.ElapsedMilliseconds }
+            }
+            return [pscustomobject]@{ Status = 'ERROR'; Detail = (Format-SocketError -Exception $_.Exception); DurationMs = $sw.ElapsedMilliseconds }
+        }
+    }
+    catch [System.Net.Sockets.SocketException] {
+        $sw.Stop()
+        return [pscustomobject]@{ Status = 'ERROR'; Detail = (Format-SocketError -Exception $_.Exception); DurationMs = $sw.ElapsedMilliseconds }
+    }
+    catch {
+        $sw.Stop()
+        return [pscustomobject]@{ Status = 'ERROR'; Detail = $_.Exception.Message; DurationMs = $sw.ElapsedMilliseconds }
+    }
+    finally {
+        if ($socket) { $socket.Dispose() }
+    }
+}
+
+function Test-PingPacket {
+    param(
+        [Parameter(Mandatory)] [string]$HostName,
+        [Parameter(Mandatory)] [int]$TotalSize,
+        [Parameter(Mandatory)] [int]$TimeoutMs
+    )
+
+    $address = Resolve-TargetAddress -HostName $HostName
+    $headerSize = if ($address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { 28 } else { 48 }
+
+    if ($TotalSize -lt $headerSize) {
+        throw "Ping size $TotalSize is too small for $([string]$address.AddressFamily). Minimum total IP+ICMP size is $headerSize bytes."
+    }
+
+    if ($TotalSize -gt 65535) {
+        throw 'Ping total size cannot exceed 65535 bytes.'
+    }
+
+    $payloadSize = $TotalSize - $headerSize
+    $buffer = New-Object byte[] $payloadSize
+    $options = New-Object System.Net.NetworkInformation.PingOptions
+    $ping = New-Object System.Net.NetworkInformation.Ping
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    try {
+        $reply = $ping.Send($address, $TimeoutMs, $buffer, $options)
+        $sw.Stop()
+        if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+            return [pscustomobject]@{
+                Status = 'REPLY'
+                Detail = "reply=$($reply.RoundtripTime) ms, ttl=$($reply.Options.Ttl), total=$TotalSize bytes, payload=$payloadSize bytes"
+                DurationMs = $sw.ElapsedMilliseconds
+            }
+        }
+
+        return [pscustomobject]@{
+            Status = 'NO-REPLY'
+            Detail = "status=$($reply.Status), total=$TotalSize bytes, payload=$payloadSize bytes"
+            DurationMs = $sw.ElapsedMilliseconds
+        }
+    }
+    finally {
+        $ping.Dispose()
+    }
+}
+
+function Write-ActionResult {
+    param(
+        [string]$Kind,
+        [string]$Target,
+        [string]$Endpoint,
+        $Result
+    )
+
+    $extra = if ($Result.DurationMs -ge 0) { " ($($Result.DurationMs) ms)" } else { '' }
+    Write-Output ("[{0}] {1} {2} -> {3}: {4}{5}" -f $Kind, $Target, $Endpoint, $Result.Status, $Result.Detail, $extra)
+}
+
+function Invoke-Tcp {
+    param([string]$HostName, [string]$PortSpec, [int]$TimeoutMs)
+    $ports = Parse-PortSpec $PortSpec
+    $result = Test-TcpPort -HostName $HostName -RemotePort $ports.RemotePort -SourcePort $ports.SourcePort -TimeoutMs $TimeoutMs
+    $endpoint = if ($null -eq $ports.SourcePort) { ":$($ports.RemotePort)" } else { "$($ports.SourcePort):$($ports.RemotePort)" }
+    Write-ActionResult 'TCP' $HostName $endpoint $result
+}
+
+function Invoke-Udp {
+    param([string]$HostName, [string]$PortSpec, [int]$TimeoutMs)
+    $ports = Parse-PortSpec $PortSpec
+    $result = Test-UdpPort -HostName $HostName -RemotePort $ports.RemotePort -SourcePort $ports.SourcePort -TimeoutMs $TimeoutMs
+    $endpoint = if ($null -eq $ports.SourcePort) { ":$($ports.RemotePort)" } else { "$($ports.SourcePort):$($ports.RemotePort)" }
+    Write-ActionResult 'UDP' $HostName $endpoint $result
+}
+
+function Invoke-Ping {
+    param([string]$HostName, [int]$Count, [int]$TotalSize, [int]$TimeoutMs)
+
+    if ($Count -lt 1) { throw 'Ping count must be >= 1.' }
+    if ($Count -gt 1000) { throw 'Ping count is limited to 1000.' }
+
+    for ($n = 1; $n -le $Count; $n++) {
+        $result = Test-PingPacket -HostName $HostName -TotalSize $TotalSize -TimeoutMs $TimeoutMs
+        Write-ActionResult 'PING' $HostName "#$n size=$TotalSize" $result
+    }
+}
+
+function Get-OptionalIntegerArgument {
+    param(
+        [string[]]$Tokens,
+        [ref]$Index,
+        [int]$DefaultValue
+    )
+
+    if ($Index.Value -ge $Tokens.Count) {
+        return $DefaultValue
+    }
+
+    $candidate = $Tokens[$Index.Value]
+    if (-not (Is-IntegerToken $candidate)) {
+        return $DefaultValue
+    }
+
+    $Index.Value++
+    return [int]$candidate
+}
+
+function Invoke-DefaultTemplate {
+    param([string]$HostName, [string]$Port, [string]$Size, [int]$TimeoutMs)
+
+    if (-not (Is-IntegerToken $Port)) { throw "Default template: invalid port '$Port'." }
+    if (-not (Is-IntegerToken $Size)) { throw "Default template: invalid ping size '$Size'." }
+    Invoke-Tcp -HostName $HostName -PortSpec $Port -TimeoutMs $TimeoutMs
+    Invoke-Ping -HostName $HostName -Count 1 -TotalSize ([int]$Size) -TimeoutMs $TimeoutMs
+}
+
+# This URL must return this exact script when requested with Invoke-RestMethod.
+$script:SourceUrl = 'https://knock.su'
+$script:RemoteStageEnvironmentVariable = 'KNOCK_REMOTE_STAGE'
+$script:IsRemoteScriptBlock = Test-RemoteScriptBlock
+$script:LastPingCount = 1
+
+# No parameters have a special bootstrap workflow only when this script is being
+# executed directly from a remote ScriptBlock. A local .\knock.ps1 never saves
+# itself and simply shows normal help when called without arguments.
+$tokens = @($args | ForEach-Object { [string]$_ })
+
+if ($tokens.Count -eq 0) {
+    if ($script:IsRemoteScriptBlock) {
+        Invoke-RemoteNoParameterBootstrap -SourceUrl $script:SourceUrl -EnvMarkerName $script:RemoteStageEnvironmentVariable
+    } else {
+        Show-Usage
+    }
+    return
+}
+
+# Any remote invocation that contains parameters cancels a pending no-argument
+# bootstrap stage and executes only the requested commands.
+if ($script:IsRemoteScriptBlock) {
+    [Environment]::SetEnvironmentVariable($script:RemoteStageEnvironmentVariable, $null, 'Process')
+}
+
+if ($tokens.Count -eq 1 -and ($tokens[0] -eq 'help' -or $tokens[0] -eq '--help')) {
+    Show-Usage
+    return
+}
+
+function Is-CommandToken {
+    param([string]$Value)
+    switch ($Value.ToLowerInvariant()) {
+        'tcp' { return $true }
+        'udp' { return $true }
+        'ping' { return $true }
+        'delay' { return $true }
+        'ip' { return $true }
+        'host' { return $true }
+        'timeout' { return $true }
+        '2' { return $true }
+        'icmp' { return $true }
+        'help' { return $true }
+        '--tcp' { return $true }
+        '--udp' { return $true }
+        '--ping' { return $true }
+        '--delay' { return $true }
+        '--ip' { return $true }
+        '--host' { return $true }
+        '--timeout' { return $true }
+        '--2' { return $true }
+        '--icmp' { return $true }
+        '--help' { return $true }
+        default { return $false }
+    }
+}
+
+function Normalize-Command {
+    param([string]$Value)
+    if ($Value.StartsWith('--')) { return $Value.Substring(2).ToLowerInvariant() }
+    return $Value.ToLowerInvariant()
+}
+
+function Test-PortLikeToken {
+    param([string]$Value)
+    return $Value -match '^\d+(?::\d+)?$'
+}
+
+function Get-CommandHost {
+    param(
+        [string]$CurrentHost,
+        [string[]]$Tokens,
+        [ref]$Index,
+        [string]$CommandName
+    )
+
+    $hostName = $CurrentHost
+    if ($Index.Value -lt $Tokens.Count -and -not (Is-CommandToken $Tokens[$Index.Value]) -and -not (Test-PortLikeToken $Tokens[$Index.Value]) -and -not (Is-IntegerToken $Tokens[$Index.Value])) {
+        $hostName = $Tokens[$Index.Value]
+        $Index.Value++
+    }
+
+    if ($null -eq $hostName -or [string]::IsNullOrWhiteSpace($hostName)) {
+        throw "$CommandName requires a host. Use 'ip HOST' first or specify HOST after the command."
+    }
+    return $hostName
+}
+
+function Invoke-PingCommand {
+    param(
+        [string]$CurrentHost,
+        [string[]]$Tokens,
+        [ref]$Index,
+        [int]$TimeoutMs
+    )
+
+    $hostName = Get-CommandHost -CurrentHost $CurrentHost -Tokens $Tokens -Index $Index -CommandName 'ping'
+    $count = 1
+    $size = 32
+
+    if ($Index.Value -lt $Tokens.Count -and (Is-IntegerToken $Tokens[$Index.Value])) {
+        $first = [int]$Tokens[$Index.Value]
+        $Index.Value++
+        if ($Index.Value -lt $Tokens.Count -and (Is-IntegerToken $Tokens[$Index.Value])) {
+            $count = $first
+            $size = [int]$Tokens[$Index.Value]
+            $Index.Value++
+        } else {
+            $size = $first
+        }
+    }
+
+    Invoke-Ping -HostName $hostName -Count $count -TotalSize $size -TimeoutMs $TimeoutMs
+    $script:LastPingCount = $count
+}
+
+function Invoke-TcpOrUdpCommand {
+    param(
+        [ValidateSet('tcp','udp')][string]$Protocol,
+        [string]$CurrentHost,
+        [string[]]$Tokens,
+        [ref]$Index,
+        [int]$TimeoutMs
+    )
+
+    $hostName = Get-CommandHost -CurrentHost $CurrentHost -Tokens $Tokens -Index $Index -CommandName $Protocol
+    if ($Index.Value -ge $Tokens.Count) { throw "$Protocol requires a port." }
+    $portSpec = $Tokens[$Index.Value]
+    if (-not (Test-PortLikeToken $portSpec)) { throw "$Protocol requires PORT or SOURCE:PORT." }
+    $Index.Value++
+
+    if ($Protocol -eq 'tcp') {
+        Invoke-Tcp -HostName $hostName -PortSpec $portSpec -TimeoutMs $TimeoutMs
+    } else {
+        Invoke-Udp -HostName $hostName -PortSpec $portSpec -TimeoutMs $TimeoutMs
+    }
+}
+
+# Default positional algorithm: <host> <port> <size>
+if ($tokens.Count -eq 3 -and -not (Is-CommandToken $tokens[0]) -and (Test-PortLikeToken $tokens[1]) -and (Is-IntegerToken $tokens[2])) {
+    try {
+        Invoke-DefaultTemplate -HostName $tokens[0] -Port $tokens[1] -Size $tokens[2] -TimeoutMs $script:DefaultTimeoutMs
+        return
+    } catch {
+        Write-Error $_.Exception.Message
+        return
+    }
+}
+
+$currentHost = $null
+$currentTimeoutMs = $script:DefaultTimeoutMs
+$i = 0
+$actionCount = 0
+
+try {
+    while ($i -lt $tokens.Count) {
+        $rawToken = $tokens[$i]
+        $token = Normalize-Command $rawToken
+
+        switch ($token) {
+            'ip' {
+                $i++
+                if ($i -ge $tokens.Count -or (Is-CommandToken $tokens[$i])) { throw 'ip requires a host.' }
+                $currentHost = $tokens[$i]
+                $i++
+                continue
+            }
+
+            'host' {
+                $i++
+                if ($i -ge $tokens.Count -or (Is-CommandToken $tokens[$i])) { throw 'host requires a host.' }
+                $currentHost = $tokens[$i]
+                $i++
+                continue
+            }
+
+            'timeout' {
+                $i++
+                if ($i -ge $tokens.Count -or -not (Is-IntegerToken $tokens[$i])) { throw 'timeout requires milliseconds.' }
+                $currentTimeoutMs = [int]$tokens[$i]
+                if ($currentTimeoutMs -lt 1 -or $currentTimeoutMs -gt 60000) { throw 'timeout must be in range 1..60000 ms.' }
+                $i++
+                continue
+            }
+
+            'delay' {
+                $delayMs = 300
+                $i++
+                if ($i -lt $tokens.Count -and (Is-IntegerToken $tokens[$i])) {
+                    $delayMs = [int]$tokens[$i]
+                    $i++
+                }
+                if ($delayMs -lt 0 -or $delayMs -gt 3600000) { throw 'delay must be in range 0..3600000 ms.' }
+                Write-Output ("[DELAY] sleeping {0} ms" -f $delayMs)
+                Start-Sleep -Milliseconds $delayMs
+                continue
+            }
+
+            'tcp' {
+                $i++
+                Invoke-TcpOrUdpCommand -Protocol tcp -CurrentHost $currentHost -Tokens $tokens -Index ([ref]$i) -TimeoutMs $currentTimeoutMs
+                $actionCount++
+                continue
+            }
+
+            'udp' {
+                $i++
+                Invoke-TcpOrUdpCommand -Protocol udp -CurrentHost $currentHost -Tokens $tokens -Index ([ref]$i) -TimeoutMs $currentTimeoutMs
+                $actionCount++
+                continue
+            }
+
+            'ping' {
+                $i++
+                Invoke-PingCommand -CurrentHost $currentHost -Tokens $tokens -Index ([ref]$i) -TimeoutMs $currentTimeoutMs
+                $actionCount += $script:LastPingCount
+                continue
+            }
+
+            '2' {
+                $i++
+                $templateHost = Get-CommandHost -CurrentHost $currentHost -Tokens $tokens -Index ([ref]$i) -CommandName '2'
+                if ($i + 1 -ge $tokens.Count) { throw '2 requires PORT SIZE.' }
+                $port = $tokens[$i]
+                $size = $tokens[$i + 1]
+                if (-not (Test-PortLikeToken $port)) { throw "2: invalid port '$port'." }
+                if (-not (Is-IntegerToken $size)) { throw "2: invalid ping size '$size'." }
+                $i += 2
+                Invoke-Tcp -HostName $templateHost -PortSpec $port -TimeoutMs $currentTimeoutMs
+                Invoke-Ping -HostName $templateHost -Count 1 -TotalSize ([int]$size) -TimeoutMs $currentTimeoutMs
+                $actionCount += 2
+                continue
+            }
+
+            'icmp' {
+                $i++
+                $templateHost = Get-CommandHost -CurrentHost $currentHost -Tokens $tokens -Index ([ref]$i) -CommandName 'icmp'
+                $sizes = New-Object System.Collections.Generic.List[int]
+                while ($i -lt $tokens.Count -and (Is-IntegerToken $tokens[$i])) {
+                    [void]$sizes.Add([int]$tokens[$i])
+                    $i++
+                }
+                if ($sizes.Count -eq 0) { throw 'icmp requires at least one packet size.' }
+
+                for ($s = 0; $s -lt $sizes.Count; $s++) {
+                    Invoke-Ping -HostName $templateHost -Count 1 -TotalSize $sizes[$s] -TimeoutMs $currentTimeoutMs
+                    $actionCount++
+                    if ($s -lt $sizes.Count - 1) { Start-Sleep -Milliseconds 1000 }
+                }
+                continue
+            }
+
+            'help' {
+                Show-Usage
+                return
+            }
+
+            default {
+                # A bare host establishes the current host at any point.
+                if (-not (Is-CommandToken $rawToken) -and $null -eq $currentHost) {
+                    $currentHost = $rawToken
+                    $i++
+                    continue
+                }
+                throw "Unknown or unexpected token '$rawToken'. Use 'help' for usage."
+            }
+        }
+    }
+}
+catch {
+    Write-Error $_.Exception.Message
+    return
+}
+
+if ($actionCount -eq 0) {
+    Write-Error 'No actions were specified. Use help for usage.'
+    return
+}
