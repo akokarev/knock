@@ -314,7 +314,7 @@ function Test-TcpPort {
 
         if (-not $waitHandle.WaitOne($TimeoutMs)) {
             $sw.Stop()
-            return [pscustomobject]@{ Status = 'TIMEOUT'; Detail = "no TCP connection within $TimeoutMs ms"; DurationMs = $sw.ElapsedMilliseconds }
+            return [pscustomobject]@{ Status = 'TIMEOUT'; Detail = "no TCP connection within $($TimeoutMs) ms"; DurationMs = $sw.ElapsedMilliseconds }
         }
 
         try {
@@ -380,12 +380,12 @@ function Test-UdpPort {
         try {
             $received = $socket.Receive($receiveBuffer, [ref]$remoteEndPoint)
             $sw.Stop()
-            return [pscustomobject]@{ Status = 'REPLY'; Detail = "UDP reply received ($received bytes)"; DurationMs = $sw.ElapsedMilliseconds }
+            return [pscustomobject]@{ Status = 'REPLY'; Detail = "UDP reply received ($($received) bytes)"; DurationMs = $sw.ElapsedMilliseconds }
         }
         catch [System.Net.Sockets.SocketException] {
             $sw.Stop()
             if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::TimedOut) {
-                return [pscustomobject]@{ Status = 'NO-REPLY'; Detail = "datagram sent; no UDP/ICMP response within $TimeoutMs ms"; DurationMs = $sw.ElapsedMilliseconds }
+                return [pscustomobject]@{ Status = 'NO-REPLY'; Detail = "datagram sent; no UDP/ICMP response within $($TimeoutMs) ms"; DurationMs = $sw.ElapsedMilliseconds }
             }
             if ($_.Exception.SocketErrorCode -eq [System.Net.Sockets.SocketError]::ConnectionReset) {
                 return [pscustomobject]@{ Status = 'ICMP-UNREACHABLE'; Detail = 'ICMP port unreachable / connection reset received'; DurationMs = $sw.ElapsedMilliseconds }
