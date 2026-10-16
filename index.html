@@ -1,4 +1,4 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 <#
 PowerShell ExecutionPolicy hints:
   Current process only:
@@ -101,7 +101,7 @@ function Parse-PortSpec {
     param([string]$Value)
 
     if ($Value -notmatch '^(\d+)(?::(\d+))?$') {
-        throw "Invalid port specification '$Value'. Expected PORT or SOURCE:PORT."
+        throw ('Invalid port specification ''{0}''. Expected PORT or SOURCE:PORT.' -f $Value)
     }
 
     # 4321       -> remote port 4321, ephemeral source port
@@ -116,7 +116,7 @@ function Parse-PortSpec {
 
     foreach ($port in @($remotePort, $sourcePort)) {
         if ($null -ne $port -and ($port -lt 1 -or $port -gt 65535)) {
-            throw "Port '$port' is outside 1..65535."
+            throw ('Port ''{0}'' is outside 1..65535.' -f $port)
         }
     }
 
@@ -186,8 +186,8 @@ function Invoke-RemoteNoParameterBootstrap {
     try {
         $source = Invoke-RestMethod -UseBasicParsing -Uri $SourceUrl -ErrorAction Stop
         $localPath = Join-Path (Get-Location) 'knock.ps1'
-        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText($localPath, [string]$source, $utf8NoBom)
+        $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+        [System.IO.File]::WriteAllText($localPath, [string]$source, $utf8Bom)
 
         $policyHint = 'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force'
         $copied = Copy-ToClipboard -Text $policyHint
@@ -221,11 +221,11 @@ function Resolve-TargetAddress {
         $addresses = [System.Net.Dns]::GetHostAddresses($HostName)
     }
     catch {
-        throw "Cannot resolve '$HostName': $($_.Exception.Message)"
+        throw ('Cannot resolve ''{0}'': {1}' -f $HostName, $_.Exception.Message)
     }
 
     if (-not $addresses -or $addresses.Count -eq 0) {
-        throw "Cannot resolve '$HostName'."
+        throw ('Cannot resolve ''{0}''.' -f $HostName)
     }
 
     # Prefer IPv4 for a stable, predictable packet-size calculation.
@@ -239,7 +239,7 @@ function Resolve-TargetAddress {
         return $ipv6[0]
     }
 
-    throw "No usable IP address found for '$HostName'."
+    throw ('No usable IP address found for ''{0}''.' -f $HostName)
 }
 
 function New-Socket {
@@ -515,8 +515,8 @@ function Get-OptionalIntegerArgument {
 function Invoke-DefaultTemplate {
     param([string]$HostName, [string]$Port, [string]$Size, [int]$TimeoutMs)
 
-    if (-not (Is-IntegerToken $Port)) { throw "Default template: invalid port '$Port'." }
-    if (-not (Is-IntegerToken $Size)) { throw "Default template: invalid ping size '$Size'." }
+    if (-not (Is-IntegerToken $Port)) { throw ('Default template: invalid port ''{0}''.' -f $Port) }
+    if (-not (Is-IntegerToken $Size)) { throw ('Default template: invalid ping size ''{0}''.' -f $Size) }
     Invoke-Tcp -HostName $HostName -PortSpec $Port -TimeoutMs $TimeoutMs
     Invoke-Ping -HostName $HostName -Count 1 -TotalSize ([int]$Size) -TimeoutMs $TimeoutMs
 }
@@ -605,7 +605,7 @@ function Get-CommandHost {
     }
 
     if ($null -eq $hostName -or [string]::IsNullOrWhiteSpace($hostName)) {
-        throw "$CommandName requires a host. Use 'ip HOST' first or specify HOST after the command."
+        throw ('{0} requires a host. Use ''ip HOST'' first or specify HOST after the command.' -f $CommandName)
     }
     return $hostName
 }
@@ -747,8 +747,8 @@ try {
                 if ($i + 1 -ge $tokens.Count) { throw '2 requires PORT SIZE.' }
                 $port = $tokens[$i]
                 $size = $tokens[$i + 1]
-                if (-not (Test-PortLikeToken $port)) { throw "2: invalid port '$port'." }
-                if (-not (Is-IntegerToken $size)) { throw "2: invalid ping size '$size'." }
+                if (-not (Test-PortLikeToken $port)) { throw ('2: invalid port ''{0}''.' -f $port) }
+                if (-not (Is-IntegerToken $size)) { throw ('2: invalid ping size ''{0}''.' -f $size) }
                 $i += 2
                 Invoke-Tcp -HostName $templateHost -PortSpec $port -TimeoutMs $currentTimeoutMs
                 Invoke-Ping -HostName $templateHost -Count 1 -TotalSize ([int]$size) -TimeoutMs $currentTimeoutMs
