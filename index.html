@@ -314,7 +314,7 @@ function Test-TcpPort {
 
         if (-not $waitHandle.WaitOne($TimeoutMs)) {
             $sw.Stop()
-            return [pscustomobject]@{ Status = 'TIMEOUT'; Detail = "no TCP connection within $($TimeoutMs) ms"; DurationMs = $sw.ElapsedMilliseconds }
+            return [pscustomobject]@{ Status = 'TIMEOUT'; Detail = ('no TCP connection within {0} ms' -f $TimeoutMs); DurationMs = $sw.ElapsedMilliseconds }
         }
 
         try {
@@ -417,7 +417,7 @@ function Test-PingPacket {
     $headerSize = if ($address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { 28 } else { 48 }
 
     if ($TotalSize -lt $headerSize) {
-        throw "Ping size $TotalSize is too small for $([string]$address.AddressFamily). Minimum total IP+ICMP size is $headerSize bytes."
+        throw ('Ping size {0} is too small for {1}. Minimum total IP+ICMP size is {2} bytes.' -f $TotalSize, [string]$address.AddressFamily, $headerSize)
     }
 
     if ($TotalSize -gt 65535) {
@@ -436,14 +436,14 @@ function Test-PingPacket {
         if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
             return [pscustomobject]@{
                 Status = 'REPLY'
-                Detail = "reply=$($reply.RoundtripTime) ms, ttl=$($reply.Options.Ttl), total=$TotalSize bytes, payload=$payloadSize bytes"
+                Detail = ('reply={0} ms, ttl={1}, total={2} bytes, payload={3} bytes' -f $reply.RoundtripTime, $reply.Options.Ttl, $TotalSize, $payloadSize)
                 DurationMs = $sw.ElapsedMilliseconds
             }
         }
 
         return [pscustomobject]@{
             Status = 'NO-REPLY'
-            Detail = "status=$($reply.Status), total=$TotalSize bytes, payload=$payloadSize bytes"
+            Detail = ('status={0}, total={1} bytes, payload={2} bytes' -f $reply.Status, $TotalSize, $payloadSize)
             DurationMs = $sw.ElapsedMilliseconds
         }
     }
@@ -460,7 +460,7 @@ function Write-ActionResult {
         $Result
     )
 
-    $extra = if ($Result.DurationMs -ge 0) { " ($($Result.DurationMs) ms)" } else { '' }
+    $extra = if ($Result.DurationMs -ge 0) { ' ({0} ms)' -f $Result.DurationMs } else { '' }
     Write-Output ("[{0}] {1} {2} -> {3}: {4}{5}" -f $Kind, $Target, $Endpoint, $Result.Status, $Result.Detail, $extra)
 }
 
