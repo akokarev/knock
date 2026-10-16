@@ -1,4 +1,4 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 <#
 PowerShell ExecutionPolicy hints:
   Current process only:
@@ -184,10 +184,14 @@ function Invoke-RemoteNoParameterBootstrap {
 
     # Second remote run without parameters: save the full script locally.
     try {
-        $source = Invoke-RestMethod -UseBasicParsing -Uri $SourceUrl -ErrorAction Stop
+        $source = [string](Invoke-RestMethod -UseBasicParsing -Uri $SourceUrl -ErrorAction Stop)
+        # Remove any leading BOM from the downloaded text before saving; WriteAllText adds one BOM for Windows PowerShell 5.1.
+        if ($source.Length -gt 0 -and $source[0] -eq [char]0xFEFF) {
+            $source = $source.Substring(1)
+        }
         $localPath = Join-Path (Get-Location) 'knock.ps1'
         $utf8Bom = New-Object System.Text.UTF8Encoding($true)
-        [System.IO.File]::WriteAllText($localPath, [string]$source, $utf8Bom)
+        [System.IO.File]::WriteAllText($localPath, $source, $utf8Bom)
 
         $policyHint = 'Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force'
         $copied = Copy-ToClipboard -Text $policyHint
@@ -374,11 +378,10 @@ function Test-UdpPort {
         # A connected UDP socket can surface ICMP errors on Receive().
         $socket.ReceiveTimeout = $TimeoutMs
         $receiveBuffer = New-Object byte[] 65535
-        $remoteAddress = if ($address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) { [System.Net.IPAddress]::Any } else { [System.Net.IPAddress]::IPv6Any }
-        $remoteEndPoint = New-Object -TypeName System.Net.IPEndPoint -ArgumentList @($remoteAddress, 0)
 
         try {
-            $received = $socket.Receive($receiveBuffer, [ref]$remoteEndPoint)
+            # The socket is already connected; use the .NET Framework overload available in Windows PowerShell 5.1.
+            $received = $socket.Receive($receiveBuffer, 0, $receiveBuffer.Length, [System.Net.Sockets.SocketFlags]::None)
             $sw.Stop()
             return [pscustomobject]@{ Status = 'REPLY'; Detail = ('UDP reply received ({0} bytes)' -f $received); DurationMs = $sw.ElapsedMilliseconds }
         }
