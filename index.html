@@ -786,7 +786,7 @@ try {
                     $i++
                     continue
                 }
-                throw "Unknown or unexpected token '$rawToken'. Use 'help' for usage."
+                throw ('Unknown or unexpected token [{0}]. Use help for usage.' -f $rawToken)
             }
         }
     }
